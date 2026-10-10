@@ -29,6 +29,12 @@ MIN_SIM = 0.24  # min CLIP cosine(frames, text), averaged over frames and the tw
 # junk (text cards, screen recordings, wrong topic) scored 0.10-0.23, relevant clips/images 0.24-0.35 for a candidate to be accepted
 CLIP_MODEL = "clip-ViT-B-32"
 KEYWORDS_PER_SENTENCE = 2
+PIXABAY_API = "https://pixabay.com/api/videos/"
+PIXABAY_PER_PAGE = 10  # hits per search
+PIXABAY_SENTENCE_CANDS, PIXABAY_TITLE_CANDS = 3, 5  # candidates kept per sentence search / title search
+PIXABAY_MIN_DURATION = 8  # seconds; shorter hits can't fill a segment
+PIXABAY_RENDITIONS = ("small", "tiny")  # preferred -> fallback (small is ~1280x720)
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 BAD_TITLE = re.compile(r"tutorial|explained|lecture|slideshow|how to|review|presentation|infographic|facts|description|documentary|chapter|audiobook|class|course|lesson", re.I)
 GENERIC = {"history", "list", "the", "and"}  # too vague to require in a video title
 STOPWORDS = set("""about after also another because been before being between both called could during each early
@@ -65,6 +71,9 @@ def commons_json(params: dict) -> dict:
     return api_json("commons.wikimedia.org", params)
 
 
+SCENE_QUERIES: dict[str, str] = {}  # narration -> LLM stock-footage query (filled by write_script)
+
+
 def write_script(topic: str) -> tuple[str, list[str]]:
     hits = get_json({"action": "query", "list": "search", "srsearch": topic, "srlimit": 1})["query"]["search"]
     if not hits:
@@ -73,6 +82,14 @@ def write_script(topic: str) -> tuple[str, list[str]]:
     pages = get_json({"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1, "titles": title})["query"]["pages"]
     text = next(iter(pages.values()))["extract"]
     text = re.sub(r"\([^)]*\)", "", text)  # drop parentheticals (pronunciations, dates)
+    if not os.environ.get("VIDEOGEN_NO_LLM"):
+        try:
+            from script_llm import llm_script
+            scenes = llm_script(title, text)
+            SCENE_QUERIES.update({s["narration"]: s["query"] for s in scenes})
+            return title, [s["narration"] for s in scenes]
+        except Exception as e:
+            print(f"    LLM script failed ({type(e).__name__}), using Wikipedia intro")
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if 25 < len(s.strip()) < 220]
     return title, sentences[:MAX_SENTENCES]
 
@@ -124,6 +141,8 @@ def reason(r: subprocess.CompletedProcess) -> str:
 
 def keywords(sentence: str, title: str) -> str:
     """1-2 longest non-stopword words of the sentence that aren't already in the title."""
+    if sentence in SCENE_QUERIES:
+        return SCENE_QUERIES[sentence]
     skip = {w.lower() for w in re.findall(r"[A-Za-z]+", title)}
     words = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", sentence)} - STOPWORDS - skip
     return " ".join(sorted(words, key=lambda w: (-len(w), w))[:KEYWORDS_PER_SENTENCE])
@@ -225,6 +244,70 @@ def build_candidates(title: str, sentences: list[str], images: list[dict], must:
     return cands
 
 
+def pixabay_key() -> str:
+    """PIXABAY_API_KEY from the environment (even if empty), else from .env next to this script."""
+    if "PIXABAY_API_KEY" in os.environ:
+        return os.environ["PIXABAY_API_KEY"].strip()
+    try:
+        for line in ENV_FILE.read_text().splitlines():
+            k, sep, v = line.partition("=")
+            if sep and k.strip() == "PIXABAY_API_KEY":
+                return v.strip().strip("'\"")
+    except OSError:
+        pass
+    return ""
+
+
+def pixabay_search(key: str, query: str, seen: set, limit: int) -> list[dict]:
+    """Up to `limit` unseen, long-enough hits: {id, user, page, url}. Errors are masked, never raised."""
+    qs = urllib.parse.urlencode({"key": key, "q": query[:100], "per_page": PIXABAY_PER_PAGE, "safesearch": "true"})
+    try:
+        hits = json.loads(fetch(urllib.request.Request(f"{PIXABAY_API}?{qs}", headers=UA)))["hits"]
+    except Exception as e:
+        print(f"    pixabay search failed for {query!r}: {type(e).__name__}: {str(e).replace(key, '***')}"[:200], file=sys.stderr)
+        return []
+    out = []
+    for h in hits:
+        rend = next((h["videos"][r] for r in PIXABAY_RENDITIONS if h.get("videos", {}).get(r, {}).get("url")), None)
+        if rend and h.get("duration", 0) >= PIXABAY_MIN_DURATION and h["id"] not in seen:
+            seen.add(h["id"])
+            out.append({"id": h["id"], "user": h.get("user", "unknown"), "page": h.get("pageURL") or f"https://pixabay.com/videos/id-{h['id']}/",
+                        "url": rend["url"], "duration": h["duration"]})
+        if len(out) == limit:
+            break
+    return out
+
+
+def pixabay_clip(h: dict, work: Path) -> dict | None:
+    """Download the rendition and cut the same CLIP_LEN window (from CLIP_START) as YouTube clips."""
+    src, path = work / f"pix_{h['id']}_src.mp4", work / f"pix_{h['id']}.mp4"
+    try:
+        src.write_bytes(fetch(urllib.request.Request(h["url"], headers=UA), 60))
+        start = max(0.0, min(h["duration"] * CLIP_START, h["duration"] - CLIP_LEN))
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", str(CLIP_LEN), "-i", str(src), "-an",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", str(path)], capture_output=True, text=True)
+        if r.returncode or not path.exists():
+            raise RuntimeError(r.stderr.strip()[-120:] or "ffmpeg failed")
+        frames = clip_frames(path)
+    except Exception as e:
+        print(f"    pixabay clip {h['id']} failed: {type(e).__name__}: {e}"[:200], file=sys.stderr)
+        return None
+    return {"kind": "pixabay", "path": path, "frames": frames, "credit": f"{h['page']} - {h['user']} (Pixabay Content License)"} if frames else None
+
+
+def pixabay_candidates(key: str, title: str, sentences: list[str], missing: list[int], work: Path) -> list[dict]:
+    """Search (1 per missing sentence + 1 title query) and download Pixabay clips, embedded like the others."""
+    seen: set = set()
+    jobs = [(f"{title} {keywords(sentences[i], title)}".strip(), PIXABAY_SENTENCE_CANDS) for i in missing] + [(title, PIXABAY_TITLE_CANDS)]
+    hits = [h for q, n in jobs for h in pixabay_search(key, q, seen, n)]
+    print(f"    pixabay: {len(jobs)} searches, {len(hits)} candidates, downloading...")
+    with cf.ThreadPoolExecutor(WORKERS) as ex:
+        cands = [c for c in ex.map(lambda h: pixabay_clip(h, work), hits) if c]
+    for c in cands:
+        c["emb"] = embed(c.pop("frames"))
+    return cands
+
+
 def score_matrix(cands: list[dict], title: str, sentences: list[str]) -> list[list[float]]:
     """sims[sentence][candidate]: cosine of frames with "<title>: <sentence>" and with the plain
     sentence, averaged over frames and both texts (the title text anchors the subject, the plain one
@@ -233,22 +316,31 @@ def score_matrix(cands: list[dict], title: str, sentences: list[str]) -> list[li
     return [[float((c["emb"] @ t[i]).mean()) for c in cands] for i in range(len(sentences))]
 
 
+def greedy_pass(sims: list[list[float]], cands: list[dict], kinds: tuple[str, ...], floor: float,
+                chosen: dict[int, tuple[int, float]], used: set[int]) -> None:
+    """Globally greedy: best (sentence, candidate of `kinds`) pairs >= floor first; mutates chosen/used."""
+    pairs = sorted(((sims[i][j], i, j) for i in range(len(sims)) for j, c in enumerate(cands) if c["kind"] in kinds), reverse=True)
+    for sim, i, j in pairs:
+        if sim >= floor and i not in chosen and j not in used:
+            chosen[i] = (j, sim)
+            used.add(j)
+
+
+def uncovered(sims: list[list[float]], cands: list[dict]) -> list[int]:
+    """Sentences left without a passing clip after the YouTube pass."""
+    chosen: dict[int, tuple[int, float]] = {}
+    greedy_pass(sims, cands, ("clip",), MIN_SIM, chosen, set())
+    return [i for i in range(len(sims)) if i not in chosen]
+
+
 def assign(sims: list[list[float]], cands: list[dict]) -> list[tuple[int, float]]:
-    """Pick one unused candidate per sentence: best passing clips first (globally greedy),
+    """Pick one unused candidate per sentence: passing YouTube clips, then passing Pixabay clips,
     then passing images, then best available (with a warning)."""
     n = len(sims)
     chosen: dict[int, tuple[int, float]] = {}
     used: set[int] = set()
-
-    def greedy(kinds: tuple[str, ...], floor: float) -> None:
-        pairs = sorted(((sims[i][j], i, j) for i in range(n) for j, c in enumerate(cands) if c["kind"] in kinds), reverse=True)
-        for sim, i, j in pairs:
-            if sim >= floor and i not in chosen and j not in used:
-                chosen[i] = (j, sim)
-                used.add(j)
-
-    greedy(("clip",), MIN_SIM)
-    greedy(("image",), MIN_SIM)
+    for kinds in (("clip",), ("pixabay",), ("image",)):
+        greedy_pass(sims, cands, kinds, MIN_SIM, chosen, used)
     for i in range(n):
         if i not in chosen:
             greedy_pick = max((j for j in range(len(cands)) if j not in used), key=lambda j: sims[i][j], default=None)
@@ -403,6 +495,15 @@ def main() -> None:
     must = max((w for w in re.findall(r"[A-Za-z]{3,}", title) if w.lower() not in GENERIC), key=len, default="").lower()  # relevance: video title must mention it
     cands = build_candidates(title, sentences, images, must, work)
     sims = score_matrix(cands, title, sentences)
+    key = pixabay_key()
+    if key:  # fallback source: only for sentences no YouTube clip covers
+        missing = uncovered(sims, cands)
+        if missing:
+            print(f"    {len(missing)} sentence(s) without a passing YouTube clip; trying Pixabay...")
+            cands += pixabay_candidates(key, title, sentences, missing, work)
+            sims = score_matrix(cands, title, sentences)
+        else:
+            print("    pixabay: 0 searches")
     media = []
     for i, (j, sim) in enumerate(assign(sims, cands)):
         c = cands[j]
