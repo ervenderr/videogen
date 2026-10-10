@@ -6,3 +6,4 @@ node_modules/
 .next/
 web/outputs/
 .env*
+.DS_Store
