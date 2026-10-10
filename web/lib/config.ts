@@ -1,0 +1,10 @@
+export const PYTHON_BIN = "/Users/ervenderr/Projects/videogen/.venv/bin/python";
+export const SCRIPT_DIR = "/Users/ervenderr/Projects/videogen";
+export const SCRIPT_PATH = `${SCRIPT_DIR}/videogen.py`;
+export const OUTPUT_DIR = "/Users/ervenderr/Projects/videogen/web/outputs";
+export const MAX_ACTIVE_JOBS = 2;
+export const TOPIC_MIN = 3;
+export const TOPIC_MAX = 100;
+export const JOB_LIST_LIMIT = 20;
+export const STDERR_TAIL_CHARS = 1000;
+export const POLL_MS = 2000;

@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.mp4
+*.credits.txt
+node_modules/
+.next/
+web/outputs/
+.env*
