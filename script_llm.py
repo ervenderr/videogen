@@ -4,10 +4,11 @@ from pathlib import Path
 
 API_URL = "https://inference.dahl.global/v1/chat/completions"
 MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
-MAX_TOKENS = 8000  # reasoning tokens count against this
+MAX_TOKENS = 3000  # output is ~250 tokens with reasoning off; headroom for retries
+REASONING_EFFORT = "none"  # measured: 2-6 s vs 15-90 s with default reasoning
 TEMPERATURE = 0.7
 TIMEOUT = 150
-ATTEMPTS = 2  # one retry on invalid output
+ATTEMPTS = 3  # retries on invalid output (each call is only ~3 s now)
 WIKI_CHARS = 6000
 SCENES_MIN, SCENES_MAX = 4, 8
 WORDS_MIN, WORDS_MAX = 12, 25
@@ -45,7 +46,8 @@ def api_key() -> str:
 
 def chat(key: str, messages: list[dict]) -> str:
     """POST one chat completion; return ONLY message.content. Errors never include the key."""
-    body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE}).encode()
+    body = json.dumps({"model": MODEL, "messages": messages, "max_tokens": MAX_TOKENS,
+                       "temperature": TEMPERATURE, "reasoning_effort": REASONING_EFFORT}).encode()
     req = urllib.request.Request(API_URL, body, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         data = json.load(r)
@@ -74,17 +76,18 @@ def validate(data: dict) -> list[dict]:
     if not isinstance(scenes, list) or not SCENES_MIN <= len(scenes) <= SCENES_MAX:
         raise ValueError("bad scene count")
     out = []
-    for s in scenes:
+    for i, s in enumerate(scenes, 1):
         if not isinstance(s, dict) or not isinstance(s.get("narration"), str) or not isinstance(s.get("query"), str):
             raise ValueError("scene fields must be strings")
         narration, query = " ".join(s["narration"].split()), " ".join(s["query"].split())
         if not WORDS_MIN <= len(narration.split()) <= WORDS_MAX:
-            raise ValueError("narration length out of range")
+            raise ValueError(f"scene {i} narration has {len(narration.split())} words, need {WORDS_MIN}-{WORDS_MAX}")
         query = " ".join(query.split()[:QUERY_WORDS_MAX])  # repair: keep the first 4 words
         if len(query.split()) < QUERY_WORDS_MIN:
             raise ValueError("query too short")
         if BAD_TEXT.search(narration) or BAD_TEXT.search(query):
-            raise ValueError("url/markdown in scene")
+            bad = sorted({m.group() for t in (narration, query) for m in BAD_TEXT.finditer(t)})
+            raise ValueError(f"scene {i} has forbidden characters {bad}; reword without them")
         out.append({"narration": narration, "query": query})
     return out
 

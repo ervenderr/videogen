@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """topic -> mp4. No API keys: Wikipedia (script) + Wikimedia Commons (images)
 + edge-tts neural voiceover (macOS `say` fallback) + Pillow (captions) + ffmpeg (Ken Burns, mix, music)."""
-import asyncio, concurrent.futures as cf, html, os, json, re, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+import asyncio, concurrent.futures as cf, html, math, os, json, re, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -198,14 +198,22 @@ def embed(items: list):
 
 def clip_frames(path: Path) -> list[Image.Image]:
     """FRAMES_PER_CLIP evenly spread frames from a downloaded clip."""
-    length = duration(path)
+    length = probe_duration(path)
+    if length is None:
+        print(f"    skipping {path.name}: unreadable or no valid duration", file=sys.stderr)
+        return []
     frames = []
     for k in range(FRAMES_PER_CLIP):
         png = path.with_suffix(f".f{k}.png")
         t = length * (k + 0.5) / FRAMES_PER_CLIP
-        subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", str(path), "-frames:v", "1", "-vf", "scale=-2:360", str(png)])
-        if png.exists():
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", str(path), "-frames:v", "1", "-vf", "scale=-2:360", str(png)],
+                           capture_output=True, text=True)
+        if r.returncode or not png.exists():
+            continue
+        try:
             frames.append(Image.open(png).convert("RGB"))
+        except (OSError, ValueError) as e:
+            print(f"    skipping frame {k} of {path.name}: {type(e).__name__}", file=sys.stderr)
     return frames
 
 
@@ -357,6 +365,18 @@ def run(cmd: list) -> str:
     if r.returncode:
         sys.exit(f"FAILED: {' '.join(map(str, cmd))[:200]}\n{r.stderr[-1500:]}")
     return r.stdout
+
+
+def probe_duration(path: Path) -> float | None:
+    """Container duration in seconds, or None if ffprobe fails or reports N/A/empty/non-finite/<=0.
+    For optional candidates only; assembled segments use duration(), which fails loudly."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                       capture_output=True, text=True)
+    try:
+        d = float(r.stdout.strip()) if r.returncode == 0 else None
+    except ValueError:
+        return None
+    return d if d is not None and math.isfinite(d) and d > 0 else None
 
 
 def duration(path: Path) -> float:
