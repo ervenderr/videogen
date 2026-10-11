@@ -8,6 +8,8 @@ topic -> Wikipedia text -> LLM script (6 scenes) -> footage per scene -> voiceov
 
 Prototype quality. It works end to end, but footage accuracy and script facts need a human check before publishing.
 
+Sample output: [`samples/great-barrier-reef.mp4`](samples/great-barrier-reef.mp4) (credits in the `.credits.txt` next to it).
+
 ## How it works
 
 1. **Script**: fetches the Wikipedia intro, then an LLM (DeepSeek-V4-Flash via the Dahl API) writes ~6 punchy scenes grounded in that text, each with a visual search phrase. If the LLM fails, it uses the Wikipedia sentences.
