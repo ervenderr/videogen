@@ -67,6 +67,12 @@ npm run build && npm start -- -p 3100   # http://localhost:3100
 
 No auth, so run it locally only.
 
+## Built with
+
+- **Claude Code** for AI-assisted development: research, pipeline code, the web app, QA and testing.
+- **AI in the product:** DeepSeek-V4-Flash (Dahl API) writes the script, CLIP (`clip-ViT-B-32`) matches footage to sentences, edge-tts voices the narration.
+- **Tools:** Python, ffmpeg, Pillow, yt-dlp, Pixabay API, Wikipedia and Wikimedia Commons, Next.js, Postgres, Playwright (browser testing).
+
 ## Credits and licensing
 
 - YouTube clips are CC-BY: credit the creators listed in `<out>.credits.txt` if you publish.
